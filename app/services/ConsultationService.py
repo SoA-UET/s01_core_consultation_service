@@ -65,6 +65,11 @@ class ConsultationService:
         self.a38_request_queue = os.getenv("A38_REQUEST_QUEUE", "s01_s20_requests")
         self.a38_response_queue = os.getenv("A38_RESPONSE_QUEUE", "s01_s20_responses")
         
+        # A03 - S08 Metrics Service
+        self.a03a_queue = os.getenv("A03A_QUEUE_NAME", "s01_events_queue")
+        self.a03b_request_queue = os.getenv("A03B_REQUEST_QUEUE", "s08_s01_requests_queue")
+        self.a03b_response_queue = os.getenv("A03B_RESPONSE_QUEUE", "s08_s01_responses_queue")
+        
         # Threading
         self.num_threads = int(os.getenv("S01_NUM_THREADS", "4"))
         self.threads: list[threading.Thread] = []
@@ -110,6 +115,11 @@ class ConsultationService:
             threading.Thread(target=self._consume_a38_responses, daemon=True)
         )
         
+        # A03b - S08 Metrics Service requests
+        self.threads.append(
+            threading.Thread(target=self._consume_a03b_requests, daemon=True)
+        )
+        
         for t in self.threads:
             t.start()
         
@@ -152,6 +162,9 @@ class ConsultationService:
                 result = conversations_collection.insert_one(conversation)
                 conversation['id'] = str(result.inserted_id)
                 del conversation['_id']
+                
+                # Send conversation_start event to S08
+                self._send_conversation_start_event(conversation['id'], customer_id, None)
                 
                 return jsonify({
                     'status': 'success',
@@ -277,6 +290,9 @@ class ConsultationService:
                     {'_id': ObjectId(conversation_id)},
                     {'$set': {'customer_satisfaction': rating, 'updated_at': datetime.utcnow()}}
                 )
+                
+                # Send customer_satisfaction_changed event to S08
+                self._send_customer_satisfaction_changed_event(conversation_id, None, None, rating)
                 
                 # Notify S19 via A36a event rating_changed
                 self._send_rating_changed_event(conversation_id, None, rating)
@@ -685,6 +701,9 @@ class ConsultationService:
                     {'$set': {'partner_id': partner_id, 'updated_at': datetime.utcnow()}}
                 )
                 
+                # Send conversation_forwarded event to S08
+                self._send_conversation_forwarded_event(conversation_id, partner_id)
+                
                 # Send consultation_request to S13 via A10a
                 self._send_consultation_request_to_partner(conversation_id, partner_id)
             else:
@@ -758,11 +777,20 @@ class ConsultationService:
     
     def _switch_to_forwarding_status(self, conversation_id: str):
         """Switch conversation status to FORWARDING"""
+        # Get current status before update
+        conversation = conversations_collection.find_one({'_id': ObjectId(conversation_id)})
+        old_status = conversation.get('status') if conversation else None
+        
         conversations_collection.update_one(
             {'_id': ObjectId(conversation_id)},
             {'$set': {'status': 'FORWARDING', 'updated_at': datetime.utcnow()}}
         )
         self.socketio.emit('status_switch', {'status': 'FORWARDING'}, room=conversation_id)
+        
+        # Send status update event to S08
+        if old_status and old_status != 'FORWARDING':
+            self._send_conversation_status_update_event(conversation_id, None, old_status, 'FORWARDING')
+        
         print(f"[S01] Conversation {conversation_id} switched to FORWARDING")
     
     def _revert_to_ai_agent(self, conversation_id: str):
@@ -905,3 +933,251 @@ class ConsultationService:
         if 'created_at' in msg and isinstance(msg['created_at'], datetime):
             msg['created_at'] = msg['created_at'].isoformat()
         return msg
+    
+    # ===== A03a - Events to S08 Metrics Service =====
+    
+    def _send_conversation_start_event(self, conversation_id: str, customer_id: str, partner_id: Optional[str]):
+        """Send conversation_start event to S08 via A03a"""
+        event_msg = {
+            'event_type': 'conversation_start',
+            'params': {
+                'conversation_id': conversation_id,
+                'customer_id': customer_id,
+                'partner_id': partner_id,
+                'created_at': datetime.utcnow().isoformat() + 'Z'
+            },
+            'id': str(uuid.uuid4())
+        }
+        
+        with self.mq_lock:
+            mq = self.mq_service.clone()
+        mq.declare_queue(self.a03a_queue)
+        mq.publish_message(self.a03a_queue, event_msg)
+        print(f"[S01] Sent conversation_start event for conversation {conversation_id}")
+    
+    def _send_conversation_status_update_event(self, conversation_id: str, partner_id: Optional[str], 
+                                               old_status: str, new_status: str):
+        """Send conversation_status_update event to S08 via A03a"""
+        event_msg = {
+            'event_type': 'conversation_status_update',
+            'params': {
+                'conversation_id': conversation_id,
+                'partner_id': partner_id,
+                'old_status': old_status,
+                'new_status': new_status,
+                'updated_at': datetime.utcnow().isoformat() + 'Z'
+            },
+            'id': str(uuid.uuid4())
+        }
+        
+        with self.mq_lock:
+            mq = self.mq_service.clone()
+        mq.declare_queue(self.a03a_queue)
+        mq.publish_message(self.a03a_queue, event_msg)
+        print(f"[S01] Sent conversation_status_update event for conversation {conversation_id}: {old_status} -> {new_status}")
+    
+    def _send_customer_satisfaction_changed_event(self, conversation_id: str, partner_id: Optional[str],
+                                                  old_satisfaction: Optional[int], new_satisfaction: int):
+        """Send conversation_customer_satisfaction_changed event to S08 via A03a"""
+        event_msg = {
+            'event_type': 'conversation_customer_satisfaction_changed',
+            'params': {
+                'conversation_id': conversation_id,
+                'partner_id': partner_id,
+                'old_satisfaction': old_satisfaction,
+                'new_satisfaction': new_satisfaction,
+                'updated_at': datetime.utcnow().isoformat() + 'Z'
+            },
+            'id': str(uuid.uuid4())
+        }
+        
+        with self.mq_lock:
+            mq = self.mq_service.clone()
+        mq.declare_queue(self.a03a_queue)
+        mq.publish_message(self.a03a_queue, event_msg)
+        print(f"[S01] Sent customer_satisfaction_changed event for conversation {conversation_id}: {old_satisfaction} -> {new_satisfaction}")
+    
+    def _send_conversation_forwarded_event(self, conversation_id: str, partner_id: str):
+        """Send conversation_forwarded event to S08 via A03a"""
+        event_msg = {
+            'event_type': 'conversation_forwarded',
+            'params': {
+                'conversation_id': conversation_id,
+                'partner_id': partner_id
+            },
+            'id': str(uuid.uuid4())
+        }
+        
+        with self.mq_lock:
+            mq = self.mq_service.clone()
+        mq.declare_queue(self.a03a_queue)
+        mq.publish_message(self.a03a_queue, event_msg)
+        print(f"[S01] Sent conversation_forwarded event for conversation {conversation_id} to partner {partner_id}")
+    
+    # ===== A03b - Methods from S08 Metrics Service =====
+    
+    def _consume_a03b_requests(self):
+        """Consume A03b requests from S08"""
+        print("[S01] Starting A03b request consumer...")
+        
+        with self.mq_lock:
+            mq = self.mq_service.clone()
+        mq.declare_queue(self.a03b_request_queue)
+        
+        while True:
+            try:
+                # Receive request
+                method, props, body = mq.consume_message(self.a03b_request_queue)
+                if not body:
+                    continue
+                
+                request_data = json.loads(body)
+                request_id = request_data.get('id')
+                method_name = request_data.get('method')
+                
+                print(f"[S01] Received A03b request: {method_name} (id: {request_id})")
+                
+                # Process request
+                response = self._handle_a03b_request(method_name, request_data.get('params', {}))
+                response['id'] = request_id
+                
+                # Send response
+                with self.mq_lock:
+                    mq_resp = self.mq_service.clone()
+                mq_resp.declare_queue(self.a03b_response_queue)
+                mq_resp.publish_message(self.a03b_response_queue, response)
+                
+                print(f"[S01] Sent A03b response for request {request_id}")
+                
+            except Exception as e:
+                print(f"[S01] Error processing A03b request: {e}")
+    
+    def _handle_a03b_request(self, method: str, params: dict) -> dict:
+        """Handle A03b method requests from S08"""
+        try:
+            if method == 'get_conversation_statistics':
+                return self._get_conversation_statistics()
+            elif method == 'get_customer_satisfaction_distribution':
+                return self._get_customer_satisfaction_distribution()
+            else:
+                return {
+                    'result': {
+                        'status': 'error',
+                        'content': f'Unknown method: {method}'
+                    }
+                }
+        except Exception as e:
+            print(f"[S01] Error handling A03b method {method}: {e}")
+            return {
+                'result': {
+                    'status': 'error',
+                    'content': str(e)
+                }
+            }
+    
+    def _get_conversation_statistics(self) -> dict:
+        """Get conversation statistics for A03b"""
+        try:
+            # Get all conversations
+            conversations = list(conversations_collection.find({}))
+            
+            total_conversations = len(conversations)
+            
+            # Count by status
+            status_counts = {}
+            for conv in conversations:
+                status = conv.get('status', 'UNKNOWN')
+                status_counts[status] = status_counts.get(status, 0) + 1
+            
+            # Calculate metrics
+            ai_failed_conversations = (
+                status_counts.get('FORWARDING', 0) +
+                status_counts.get('HUMAN_AGENT_TEXTING', 0) +
+                status_counts.get('HUMAN_AGENT_CALLING', 0)
+            )
+            
+            forwarding_conversations = status_counts.get('FORWARDING', 0)
+            
+            texting_conversations = (
+                status_counts.get('AI_AGENT_TEXTING', 0) +
+                status_counts.get('HUMAN_AGENT_TEXTING', 0)
+            )
+            
+            calling_conversations = (
+                status_counts.get('AI_AGENT_CALLING', 0) +
+                status_counts.get('HUMAN_AGENT_CALLING', 0)
+            )
+            
+            offloaded_conversations = total_conversations - ai_failed_conversations
+            
+            return {
+                'result': {
+                    'status': 'success',
+                    'content': {
+                        'total_conversations': total_conversations,
+                        'ai_failed_conversations': ai_failed_conversations,
+                        'forwarding_conversations': forwarding_conversations,
+                        'texting_conversations': texting_conversations,
+                        'calling_conversations': calling_conversations,
+                        'offloaded_conversations': offloaded_conversations
+                    }
+                }
+            }
+            
+        except Exception as e:
+            print(f"[S01] DB error in get_conversation_statistics: {e}")
+            return {
+                'result': {
+                    'status': 'error',
+                    'content': 'DB_CONNECTION_ERROR'
+                }
+            }
+    
+    def _get_customer_satisfaction_distribution(self) -> dict:
+        """Get customer satisfaction distribution for A03b"""
+        try:
+            # Aggregate satisfaction ratings
+            pipeline = [
+                {
+                    '$match': {
+                        'customer_satisfaction': {'$exists': True, '$ne': None}
+                    }
+                },
+                {
+                    '$group': {
+                        '_id': '$customer_satisfaction',
+                        'count': {'$sum': 1}
+                    }
+                }
+            ]
+            
+            results = list(conversations_collection.aggregate(pipeline))
+            
+            # Build distribution dict
+            distribution = {}
+            for result in results:
+                rating = result['_id']
+                count = result['count']
+                distribution[f'satisfaction_{rating}'] = count
+            
+            # Ensure all ratings 1-5 are present (default to 0)
+            for rating in range(1, 6):
+                key = f'satisfaction_{rating}'
+                if key not in distribution:
+                    distribution[key] = 0
+            
+            return {
+                'result': {
+                    'status': 'success',
+                    'content': distribution
+                }
+            }
+            
+        except Exception as e:
+            print(f"[S01] DB error in get_customer_satisfaction_distribution: {e}")
+            return {
+                'result': {
+                    'status': 'error',
+                    'content': str(e)
+                }
+            }

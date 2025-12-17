@@ -17,6 +17,8 @@ from ..utils.jwt_auth import init_jwt_auth, jwt_required, jwt_optional
 # Load environment variables
 load_dotenv()
 
+CORS_ORIGINS = os.getenv('CORS_ALLOWED_ORIGINS', '*').split(",")
+
 
 class ConsultationService:
     """
@@ -31,14 +33,14 @@ class ConsultationService:
         self.app = Flask(__name__)
         CORS(
             self.app,
-            origins=os.getenv('CORS_ALLOWED_ORIGINS', '*').split(","),
+            origins=CORS_ORIGINS,
         )
         self.app.config['SECRET_KEY'] = os.getenv('FLASK_SECRET_KEY', 'dev-secret-key')
         
         # SocketIO setup
         self.socketio = SocketIO(
             self.app,
-            cors_allowed_origins="*",
+            cors_allowed_origins=CORS_ORIGINS,
             async_mode='threading'
         )
         

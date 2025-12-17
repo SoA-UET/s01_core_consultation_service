@@ -3,6 +3,8 @@ import os
 import threading
 import time
 import uuid
+import requests
+import base64
 from datetime import datetime
 from typing import Any, Optional
 from flask import Flask, request, jsonify
@@ -10,6 +12,7 @@ from flask_socketio import SocketIO, emit, join_room, leave_room
 from flask_cors import CORS
 from dotenv import load_dotenv
 from bson import ObjectId
+from io import BytesIO
 
 from .MessageQueueService import MessageQueueService
 from ..collections import conversations_collection, messages_collection, reviews_collection
@@ -67,9 +70,8 @@ class ConsultationService:
         self.a10a_queue = os.getenv("A10A_QUEUE_NAME", "s01_s13_events")
         self.a10b_queue = os.getenv("A10B_QUEUE_NAME", "s13_s01_events")
         
-        # A38 - S20 Speech Service
-        self.a38_request_queue = os.getenv("A38_REQUEST_QUEUE", "s01_s20_requests")
-        self.a38_response_queue = os.getenv("A38_RESPONSE_QUEUE", "s01_s20_responses")
+        # A38 - S20 Speech Service (HTTP-based)
+        self.s20_base_url = os.getenv("S20_BASE_URL", "http://localhost:5020")
         
         # A03 - S08 Metrics Service
         self.a03a_queue = os.getenv("A03A_QUEUE_NAME", "s01_events_queue")
@@ -116,9 +118,6 @@ class ConsultationService:
         )
         self.threads.append(
             threading.Thread(target=self._consume_a10b_events, daemon=True)
-        )
-        self.threads.append(
-            threading.Thread(target=self._consume_a38_responses, daemon=True)
         )
         
         # A03b - S08 Metrics Service requests
@@ -449,9 +448,14 @@ class ConsultationService:
                 # Read audio data
                 audio_data = audio_file.read()
                 
-                # TODO: Submit to S20 Speech Service for processing via A38
-                # For now, just accept the file
                 print(f"[S01] Received audio file for conversation {conversation_id}, size: {len(audio_data)} bytes")
+                
+                # Process audio in separate thread (non-blocking)
+                threading.Thread(
+                    target=self._process_voice_call_audio,
+                    args=(conversation, audio_data),
+                    daemon=True
+                ).start()
                 
                 # Return 202 Accepted with empty body
                 return '', 202
@@ -559,6 +563,138 @@ class ConsultationService:
             print(f"[S01] Client {request.sid} (user: {customer_id}) joined conversation {conversation_id}")
             emit('joined', {'conversation_id': conversation_id})
         
+        @self.socketio.on('call_start')
+        def handle_call_start(data):
+            """Handle voice call start"""
+            # Get session info
+            with self.sessions_lock:
+                session = self.active_sessions.get(request.sid)
+            
+            if not session:
+                emit('error', {'message': 'Not authenticated'})
+                return
+            
+            customer_id = session['customer_id']
+            conversation_id = data.get('conversation_id')
+            
+            if not conversation_id:
+                emit('error', {'message': 'conversation_id required'})
+                return
+            
+            # Get conversation and verify ownership
+            conversation = conversations_collection.find_one({
+                '_id': ObjectId(conversation_id),
+                'customer_id': customer_id
+            })
+            if not conversation:
+                emit('error', {'message': 'Conversation not found or access denied'})
+                return
+            
+            status = conversation.get('status')
+            
+            # Only allow call_start from AI_AGENT_TEXTING status
+            if status != 'AI_AGENT_TEXTING':
+                emit('error', {'message': f'Cannot start call from status: {status}'})
+                return
+            
+            # Update conversation status to AI_AGENT_CALLING
+            conversations_collection.update_one(
+                {'_id': ObjectId(conversation_id)},
+                {
+                    '$set': {
+                        'status': 'AI_AGENT_CALLING',
+                        'updated_at': datetime.utcnow()
+                    }
+                }
+            )
+            
+            print(f"[S01] Call started for conversation {conversation_id}")
+            
+            # Emit status change to all clients in this conversation room
+            self.socketio.emit(
+                'status_switch',
+                {
+                    'conversation_id': conversation_id,
+                    'old_status': status,
+                    'new_status': 'AI_AGENT_CALLING'
+                },
+                room=conversation_id
+            )
+            
+            # Send event to S08 Metrics Service
+            self._send_conversation_status_update_event(
+                conversation_id,
+                conversation.get('partner_id'),
+                status,
+                'AI_AGENT_CALLING'
+            )
+        
+        @self.socketio.on('call_end')
+        def handle_call_end(data):
+            """Handle voice call end"""
+            # Get session info
+            with self.sessions_lock:
+                session = self.active_sessions.get(request.sid)
+            
+            if not session:
+                emit('error', {'message': 'Not authenticated'})
+                return
+            
+            customer_id = session['customer_id']
+            conversation_id = data.get('conversation_id')
+            
+            if not conversation_id:
+                emit('error', {'message': 'conversation_id required'})
+                return
+            
+            # Get conversation and verify ownership
+            conversation = conversations_collection.find_one({
+                '_id': ObjectId(conversation_id),
+                'customer_id': customer_id
+            })
+            if not conversation:
+                emit('error', {'message': 'Conversation not found or access denied'})
+                return
+            
+            status = conversation.get('status')
+            
+            # Only allow call_end from AI_AGENT_CALLING status
+            if status != 'AI_AGENT_CALLING':
+                emit('error', {'message': f'Cannot end call from status: {status}'})
+                return
+            
+            # Update conversation status back to AI_AGENT_TEXTING
+            conversations_collection.update_one(
+                {'_id': ObjectId(conversation_id)},
+                {
+                    '$set': {
+                        'status': 'AI_AGENT_TEXTING',
+                        'updated_at': datetime.utcnow()
+                    }
+                }
+            )
+            
+            print(f"[S01] Call ended for conversation {conversation_id}")
+            
+            # Emit status change to all clients in this conversation room
+            self.socketio.emit(
+                'status_switch',
+                {
+                    'conversation_id': conversation_id,
+                    'old_status': status,
+                    'new_status': 'AI_AGENT_TEXTING'
+                },
+                room=conversation_id
+            )
+            
+            # Send event to S08 Metrics Service
+            self._send_conversation_status_update_event(
+                conversation_id,
+                conversation.get('partner_id'),
+                status,
+                'AI_AGENT_TEXTING'
+            )
+        
         @self.socketio.on('send_message')
         def handle_send_message(data):
             """Handle incoming message from customer"""
@@ -647,6 +783,7 @@ class ConsultationService:
         # Register pending request (no event needed - consumer will handle completion)
         with self.pending_requests_lock:
             self.pending_requests[request_id] = {
+                'type': 'text',  # 'text' or 'voice_call'
                 'data': {
                     'conversation_id': conversation_id,
                     'accumulated_content': '',
@@ -767,6 +904,13 @@ class ConsultationService:
             pending = self.pending_requests.get(request_id)
             if not pending:
                 print(f"[S01] No pending request found for {request_id}")
+                return
+            
+            # Check if this is a voice call
+            request_type = pending.get('type', 'text')
+            if request_type == 'voice_call':
+                # Route to voice call handler
+                self._handle_voice_call_ai_response_chunk(request_id, pending, result)
                 return
             
             status = result.get('status')
@@ -1058,19 +1202,6 @@ class ConsultationService:
             
             # Send to frontend
             self.socketio.emit('new_message', self._serialize_message(message), room=conversation_id)
-    
-    def _consume_a38_responses(self):
-        """Consumer for A38 responses from S20"""
-        with self.mq_lock:
-            mq = self.mq_service.clone()
-        mq.declare_queue(self.a38_response_queue)
-        mq.register_callback(self.a38_response_queue, self._handle_a38_response)
-        mq.start_consuming()
-    
-    def _handle_a38_response(self, message: dict):
-        """Handle A38 response from S20 Speech Service"""
-        # TODO: Implement speech service integration
-        pass
     
     # ===== Helper Methods =====
     
@@ -1501,3 +1632,201 @@ class ConsultationService:
                     'content': str(e)
                 }
             }
+    
+    # ===== Flow 2: AI Agent Handling (Voice Call) =====
+    
+    def _process_voice_call_audio(self, conversation: dict, audio_data: bytes):
+        """Process audio from voice call - Flow 2"""
+        conversation_id = str(conversation['_id'])
+        
+        try:
+            # Step 5-6: Send to S20 for STT
+            transcribed_text = self._call_s20_stt(audio_data)
+            
+            if not transcribed_text:
+                print(f"[S01] STT returned empty text for conversation {conversation_id}")
+                self.socketio.emit(
+                    'error',
+                    {'message': 'Could not transcribe audio'},
+                    room=conversation_id
+                )
+                return
+            
+            print(f"[S01] STT result: {transcribed_text}")
+            
+            # Step 7: Save customer message
+            customer_message = {
+                'conversation_id': conversation_id,
+                'sender_type': 'CUSTOMER',
+                'sender_id': conversation.get('customer_id'),
+                'sender_name': None,
+                'content': transcribed_text,
+                'emotion': 'Neutral',
+                'created_at': datetime.utcnow()
+            }
+            result = messages_collection.insert_one(customer_message)
+            customer_message['id'] = str(result.inserted_id)
+            
+            # Send to S19 for analysis
+            self._send_new_message_to_s19(customer_message, conversation)
+            
+            # Build conversation history
+            history_messages = self._get_conversation_history(conversation_id)
+            
+            # Format history as string for A02
+            history_str = ""
+            for msg in history_messages[:-1]:  # Exclude the current message
+                sender = msg.get('sender_type', 'UNKNOWN')
+                content = msg.get('content', '')
+                history_str += f"{sender}: {content}\n"
+            
+            # Step 8: Send to S02 AI Agent
+            request_id = f"{conversation_id}_voice_{int(time.time() * 1000)}"
+            
+            request_msg = {
+                'method': 'handle_inquiry',
+                'params': {
+                    'inquiry': transcribed_text,
+                    'history': history_str.strip()
+                },
+                'id': request_id
+            }
+            
+            # Register pending request for voice call
+            with self.pending_requests_lock:
+                self.pending_requests[request_id] = {
+                    'conversation_id': conversation_id,
+                    'type': 'voice_call',
+                    'data': {
+                        'full_response': '',
+                        'buffered_messages': {},
+                        'next_seq_to_emit': 0,
+                        'completed': False
+                    }
+                }
+            
+            # Send request to S02 via A02
+            with self.mq_lock:
+                mq = self.mq_service.clone()
+            mq.declare_queue(self.a02_request_queue)
+            mq.publish_message(self.a02_request_queue, request_msg)
+            
+            print(f"[S01] Sent voice inquiry to S02 for conversation {conversation_id}")
+            
+        except Exception as e:
+            print(f"[S01] Error processing voice call audio: {e}")
+            self.socketio.emit(
+                'error',
+                {'message': 'Error processing audio'},
+                room=conversation_id
+            )
+    
+    def _call_s20_stt(self, audio_data: bytes) -> Optional[str]:
+        """Call S20 Speech Service for Speech-to-Text"""
+        try:
+            url = f"{self.s20_base_url}/stt"
+            
+            # Create file-like object for multipart upload
+            files = {
+                'file': ('audio.wav', BytesIO(audio_data), 'audio/wav')
+            }
+            
+            response = requests.post(url, files=files, timeout=30)
+            response.raise_for_status()
+            
+            result = response.json()
+            return result.get('text')
+            
+        except Exception as e:
+            print(f"[S01] Error calling S20 STT: {e}")
+            return None
+    
+    def _call_s20_tts(self, text: str) -> Optional[bytes]:
+        """Call S20 Speech Service for Text-to-Speech"""
+        try:
+            url = f"{self.s20_base_url}/tts"
+            
+            payload = {'text': text}
+            response = requests.post(url, json=payload, timeout=30)
+            response.raise_for_status()
+            
+            # Response is MP3 audio data
+            return response.content
+            
+        except Exception as e:
+            print(f"[S01] Error calling S20 TTS: {e}")
+            return None
+    
+    def _handle_voice_call_ai_response_chunk(self, request_id: str, pending: dict, result: dict):
+        """Handle AI response chunk during voice call"""
+        conversation_id = pending['conversation_id']
+        
+        status = result.get('status')
+        content = result.get('content', '')
+        seq = result.get('seq', 0)
+        
+        if status == 'error':
+            # Handle error case
+            print(f"[S01] AI Agent error during voice call: {content}")
+            
+            if content == 'FORWARD':
+                # AI cannot answer, need to forward to human agent
+                self._switch_to_forwarding_status(conversation_id)
+            else:
+                self.socketio.emit(
+                    'error',
+                    {'message': f'AI Agent error: {content}'},
+                    room=conversation_id
+                )
+            
+            # Clean up
+            with self.pending_requests_lock:
+                if request_id in self.pending_requests:
+                    del self.pending_requests[request_id]
+            return
+        
+        elif status == 'success':
+            # Check if content is empty - this signals end of stream
+            if content == '':
+                # End of stream - convert accumulated text to speech
+                full_response = pending['data']['full_response']
+                
+                if full_response:
+                    # Step 9: Convert to speech via TTS
+                    audio_data = self._call_s20_tts(full_response)
+                    
+                    if audio_data:
+                        # Step 11: Send audio to frontend
+                        # Encode audio as base64 for JSON transport
+                        audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+                        
+                        self.socketio.emit(
+                            'audio_file',
+                            {
+                                'conversation_id': conversation_id,
+                                'audio_data': audio_base64,
+                                'format': 'mp3'
+                            },
+                            room=conversation_id
+                        )
+                        
+                        print(f"[S01] Sent audio response to frontend for conversation {conversation_id}")
+                        
+                        # Save AI message to database
+                        self._save_ai_message(conversation_id, full_response)
+                    else:
+                        print(f"[S01] TTS failed for conversation {conversation_id}")
+                        self.socketio.emit(
+                            'error',
+                            {'message': 'Text-to-speech conversion failed'},
+                            room=conversation_id
+                        )
+                
+                # Clean up pending request
+                with self.pending_requests_lock:
+                    if request_id in self.pending_requests:
+                        del self.pending_requests[request_id]
+            else:
+                # Accumulate response text chunk
+                pending['data']['full_response'] += content
+                print(f"[S01] Accumulated voice response chunk seq={seq}, total length: {len(pending['data']['full_response'])}")

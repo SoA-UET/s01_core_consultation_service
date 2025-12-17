@@ -623,92 +623,46 @@ class ConsultationService:
         # Send to S19 for analysis
         self._send_new_message_to_s19(customer_message, conversation)
         
-        # Send to S02 for AI response
-        def ai_response_thread():
-            try:
-                # Use conversation_id as request_id for simplicity
-                request_id = conversation_id
-                
-                # Prepare A02 request according to spec
-                history_messages = self._get_conversation_history(conversation_id)
-                history_str = "\n".join([
-                    f"{m['role'].capitalize()}: {m['content']}" 
-                    for m in history_messages
-                ])
-                
-                a02_request = {
-                    'method': 'handle_inquiry',
-                    'params': {
-                        'inquiry': customer_message['content'],
-                        'history': history_str
-                    },
-                    'id': request_id
-                }
-                
-                # Setup response handler for streaming responses
-                response_event = threading.Event()
-                response_data = {
-                    'result': None,
-                    'accumulated_content': '',
-                    'has_error': False
-                }
-                
-                with self.pending_requests_lock:
-                    self.pending_requests[request_id] = {
-                        'event': response_event,
-                        'data': response_data,
-                        'conversation_id': conversation_id
-                    }
-                
-                # Send request
-                with self.mq_lock:
-                    mq = self.mq_service.clone()
-                mq.declare_queue(self.a02_request_queue)
-                mq.publish_message(self.a02_request_queue, a02_request)
-                
-                # Wait for streaming to complete
-                # Event will be set when:
-                # 1. An error occurs
-                # 2. Empty content is received (end-of-stream marker)
-                if not response_event.wait(timeout=60.0):
-                    print(f"[S01] Timeout waiting for A02 response for conversation {conversation_id}")
-                    with self.pending_requests_lock:
-                        if request_id in self.pending_requests:
-                            del self.pending_requests[request_id]
-                    self.socketio.emit('error', {'message': 'AI Agent timeout'}, room=conversation_id)
-                    return
-                
-                # Clean up pending request
-                with self.pending_requests_lock:
-                    if request_id in self.pending_requests:
-                        del self.pending_requests[request_id]
-                
-                # Check for errors
-                if response_data.get('has_error'):
-                    error_content = response_data.get('error_content', '')
-                    if error_content == 'FORWARD':
-                        # AI can't answer, switch to FORWARDING
-                        self._switch_to_forwarding_status(conversation_id)
-                    else:
-                        self.socketio.emit('error', {'message': error_content}, room=conversation_id)
-                    return
-                
-                # Get accumulated response content and save
-                ai_response_text = response_data.get('accumulated_content', '')
-                if ai_response_text:
-                    # Save AI message (streaming already happened in real-time)
-                    self._save_ai_message(conversation_id, ai_response_text)
-                    print(f"[S01] Saved AI response for conversation {conversation_id}")
-                else:
-                    # No content received - this shouldn't happen if protocol is followed
-                    print(f"[S01] Warning: No AI response content for conversation {conversation_id}")
-            
-            except Exception as e:
-                print(f"[S01] Error in AI response thread: {e}")
-                self.socketio.emit('error', {'message': str(e)}, room=conversation_id)
+        # Build conversation history
+        history_messages = self._get_conversation_history(conversation_id)
         
-        # Run in separate thread
-        threading.Thread(target=ai_response_thread, daemon=True).start()
+        # Format history as string for A02
+        history_str = ""
+        for msg in history_messages[:-1]:  # Exclude the last message (the current customer message)
+            role_label = "User" if msg['role'] == 'user' else "Agent"
+            history_str += f"{role_label}: {msg['content']}\n"
+        
+        # Prepare request for S02
+        request_id = conversation_id  # Use conversation_id as request_id for simplicity
+        
+        request_msg = {
+            'method': 'handle_inquiry',
+            'params': {
+                'inquiry': customer_message.get('content'),
+                'history': history_str.strip()
+            },
+            'id': request_id
+        }
+        
+        # Register pending request (no event needed - consumer will handle completion)
+        with self.pending_requests_lock:
+            self.pending_requests[request_id] = {
+                'data': {
+                    'conversation_id': conversation_id,
+                    'accumulated_content': '',
+                    'has_error': False,
+                    'error_content': '',
+                    'stream_started': False
+                }
+            }
+        
+        # Send request to S02 via A02
+        with self.mq_lock:
+            mq = self.mq_service.clone()
+        mq.declare_queue(self.a02_request_queue)
+        mq.publish_message(self.a02_request_queue, request_msg)
+        
+        print(f"[S01] Sent AI inquiry to S02 for conversation {conversation_id}")
     
     def _handle_forwarding_message(self, conversation, customer_message):
         """Flow 3: Forwarding to Partner"""
@@ -816,11 +770,57 @@ class ConsultationService:
                 # Handle error response
                 pending['data']['has_error'] = True
                 pending['data']['error_content'] = content
-                pending['event'].set()
-                # Note: Don't delete here, let the waiting thread clean up
+                
+                # Handle error immediately in this thread
+                conversation_id = pending['data'].get('conversation_id')
+                if content == 'FORWARD':
+                    # AI cannot answer, need to forward to human agent
+                    print(f"[S01] AI Agent cannot answer, switching to FORWARDING status")
+                    
+                    # Update conversation status to FORWARDING
+                    conversations_collection.update_one(
+                        {'_id': ObjectId(conversation_id)},
+                        {
+                            '$set': {
+                                'status': 'FORWARDING',
+                                'updated_at': datetime.utcnow()
+                            }
+                        }
+                    )
+                    
+                    # Create artificial message to notify customer
+                    forward_msg = {
+                        'conversation_id': conversation_id,
+                        'sender_type': 'AI_AGENT',
+                        'sender_id': None,
+                        'sender_name': None,
+                        'content': 'Xin lỗi, tôi không thể trả lời câu hỏi này. Cuộc hội thoại sẽ được chuyển tiếp đến tư vấn viên.',
+                        'emotion': 'Neutral',
+                        'created_at': datetime.utcnow()
+                    }
+                    result = messages_collection.insert_one(forward_msg)
+                    forward_msg['id'] = str(result.inserted_id)
+                    
+                    # Emit status switch event
+                    self.socketio.emit('status_switch', {
+                        'conversation_id': conversation_id,
+                        'old_status': 'AI_AGENT_TEXTING',
+                        'new_status': 'FORWARDING'
+                    }, room=conversation_id)
+                    
+                    # Emit the notification message to frontend
+                    self.socketio.emit('new_message', self._serialize_message(forward_msg), room=conversation_id)
+                else:
+                    # Other error
+                    print(f"[S01] AI Agent error: {content}")
+                    self.socketio.emit('error', {'message': f'AI Agent error: {content}'}, room=conversation_id)
+                
+                # Clean up
+                del self.pending_requests[request_id]
+                
             elif status == 'success':
                 # Handle streaming success response
-                conversation_id = pending.get('conversation_id')
+                conversation_id = pending['data'].get('conversation_id')
                 
                 # Check if content is empty - this signals end of stream
                 if content == '':
@@ -830,8 +830,32 @@ class ConsultationService:
                         self.socketio.emit('text_stop', {
                             'conversation_id': conversation_id
                         }, room=conversation_id)
-                    pending['event'].set()
-                    # Note: Don't delete here, let the waiting thread clean up
+                    
+                    # Save AI response as a new message
+                    accumulated_content = pending['data'].get('accumulated_content', '')
+                    if accumulated_content:
+                        ai_message = {
+                            'conversation_id': conversation_id,
+                            'sender_type': 'AI_AGENT',
+                            'sender_id': None,
+                            'sender_name': None,
+                            'content': accumulated_content,
+                            'emotion': 'Neutral',
+                            'created_at': datetime.utcnow()
+                        }
+                        result = messages_collection.insert_one(ai_message)
+                        ai_message['id'] = str(result.inserted_id)
+                        
+                        print(f"[S01] Saved AI response message for conversation {conversation_id}")
+                        
+                        # Update conversation updated_at
+                        conversations_collection.update_one(
+                            {'_id': ObjectId(conversation_id)},
+                            {'$set': {'updated_at': datetime.utcnow()}}
+                        )
+                    
+                    # Clean up
+                    del self.pending_requests[request_id]
                     return
                 
                 # Accumulate non-empty content

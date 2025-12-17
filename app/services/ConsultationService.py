@@ -29,7 +29,10 @@ class ConsultationService:
     def __init__(self) -> None:
         # Flask app setup
         self.app = Flask(__name__)
-        CORS(self.app)
+        CORS(
+            self.app,
+            origins=os.getenv('CORS_ALLOWED_ORIGINS', '*').split(","),
+        )
         self.app.config['SECRET_KEY'] = os.getenv('FLASK_SECRET_KEY', 'dev-secret-key')
         
         # SocketIO setup

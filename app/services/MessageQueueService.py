@@ -2,6 +2,7 @@ import json
 import pika
 from typing import Callable
 import os
+import threading
 
 class MessageQueueService:
     """
@@ -19,9 +20,11 @@ class MessageQueueService:
         params.blocked_connection_timeout = 30
         self.connection = pika.BlockingConnection(params)
         self.channel = self.connection.channel()
+        self.lock = threading.Lock()
     
     def clone(self):
-        return MessageQueueService(self.rabbitmq_url)
+        with self.lock:
+            return MessageQueueService(self.rabbitmq_url)
 
     def declare_queue(self, queue_name: str):
         self.channel.queue_declare(queue=queue_name, durable=True)

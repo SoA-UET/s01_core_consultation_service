@@ -523,7 +523,7 @@ class ConsultationService:
                 if request.sid in self.active_sessions:
                     del self.active_sessions[request.sid]
         
-        @self.socketio.on('join_conversation')
+        @self.socketio.on('join')
         def handle_join_conversation(data):
             """Join a conversation room"""
             # Get session info

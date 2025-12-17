@@ -59,14 +59,69 @@ class JWTAuthenticator:
             response = requests.get(self.jwks_url, timeout=10)
             response.raise_for_status()
             
-            jwks_data = response.json()
+            jwks_response = response.json()
+            
+            # Handle different JWKS formats
+            if isinstance(jwks_response, list):
+                # Direct array format
+                if len(jwks_response) == 0:
+                    print(f"[JWTAuth] Invalid JWKS: array is empty")
+                    return False
+                jwks_data = jwks_response[0]
+                print(f"[JWTAuth] Using array format with {len(jwks_response)} key(s)")
+            elif 'keys' in jwks_response:
+                # Standard JWKS format with "keys" field
+                if not isinstance(jwks_response['keys'], list) or len(jwks_response['keys']) == 0:
+                    print(f"[JWTAuth] Invalid JWKS: 'keys' must be non-empty array")
+                    return False
+                jwks_data = jwks_response['keys'][0]
+                print(f"[JWTAuth] Using standard JWKS format with {len(jwks_response['keys'])} key(s)")
+            else:
+                # Direct key object format (as per VERIFY.md)
+                jwks_data = jwks_response
+                print(f"[JWTAuth] Using direct key object format")
             
             # Validate JWKS structure
-            required_fields = ['kid', 'kty', 'alg', 'public_key', 'use']
-            for field in required_fields:
-                if field not in jwks_data:
-                    print(f"[JWTAuth] Invalid JWKS: missing field '{field}'")
-                    return False
+            # 'public_key' might be 'n' and 'e' in standard format, or 'public_key' in custom format
+            if 'public_key' in jwks_data:
+                # Custom format with PEM public key
+                required_fields = ['kid', 'kty', 'alg', 'public_key', 'use']
+                for field in required_fields:
+                    if field not in jwks_data:
+                        print(f"[JWTAuth] Invalid JWKS: missing field '{field}'")
+                        return False
+                public_key = jwks_data['public_key']
+            elif 'n' in jwks_data and 'e' in jwks_data:
+                # Standard JWK format with modulus and exponent
+                required_fields = ['kid', 'kty', 'alg', 'n', 'e', 'use']
+                for field in required_fields:
+                    if field not in jwks_data:
+                        print(f"[JWTAuth] Invalid JWKS: missing field '{field}'")
+                        return False
+                # Convert to PEM format
+                from cryptography.hazmat.primitives.asymmetric import rsa
+                from cryptography.hazmat.primitives import serialization
+                import base64
+                
+                # Decode base64url-encoded modulus and exponent
+                n = int.from_bytes(base64.urlsafe_b64decode(jwks_data['n'] + '=='), 'big')
+                e = int.from_bytes(base64.urlsafe_b64decode(jwks_data['e'] + '=='), 'big')
+                
+                # Create RSA public key
+                public_numbers = rsa.RSAPublicNumbers(e, n)
+                public_key_obj = public_numbers.public_key()
+                
+                # Convert to PEM
+                public_key = public_key_obj.public_key_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PublicFormat.SubjectPublicKeyInfo
+                ).decode('utf-8')
+                
+                # Store in cache with public_key field
+                jwks_data['public_key'] = public_key
+            else:
+                print(f"[JWTAuth] Invalid JWKS: missing public key information")
+                return False
             
             # Validate values
             if jwks_data['kty'] not in ['RSA']:
@@ -77,7 +132,7 @@ class JWTAuthenticator:
                 print(f"[JWTAuth] Invalid algorithm: {jwks_data['alg']}")
                 return False
             
-            if jwks_data['use'] != 'sig':
+            if jwks_data['use'] not in ['sig', 'sign']:
                 print(f"[JWTAuth] Invalid use: {jwks_data['use']}")
                 return False
             
@@ -90,6 +145,8 @@ class JWTAuthenticator:
             
         except Exception as e:
             print(f"[JWTAuth] Error fetching JWKS: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     
     def _refresh_jwks_loop(self):

@@ -1022,37 +1022,41 @@ class ConsultationService:
         
         with self.mq_lock:
             mq = self.mq_service.clone()
+        mq.declare_queue(self.a02_response_queue)
+        mq.register_callback(self.a02_response_queue, self._handle_a02_response)
+        mq.start_consuming()
+
+        with self.mq_lock:
+            mq = self.mq_service.clone()
         mq.declare_queue(self.a03b_request_queue)
-        
-        while True:
-            try:
-                # Receive request
-                method, props, body = mq.consume_message(self.a03b_request_queue)
-                if not body:
-                    continue
-                
-                request_data = json.loads(body)
-                request_id = request_data.get('id')
-                method_name = request_data.get('method')
-                
-                print(f"[S01] Received A03b request: {method_name} (id: {request_id})")
-                
-                # Process request
-                response = self._handle_a03b_request(method_name, request_data.get('params', {}))
-                response['id'] = request_id
-                
-                # Send response
-                with self.mq_lock:
-                    mq_resp = self.mq_service.clone()
-                mq_resp.declare_queue(self.a03b_response_queue)
-                mq_resp.publish_message(self.a03b_response_queue, response)
-                
-                print(f"[S01] Sent A03b response for request {request_id}")
-                
-            except Exception as e:
-                print(f"[S01] Error processing A03b request: {e}")
+        mq.register_callback(self.a03b_request_queue, self._handle_a03b_request)
+        mq.start_consuming()
     
-    def _handle_a03b_request(self, method: str, params: dict) -> dict:
+    def _handle_a03b_request(self, message: dict):
+        """Handle A03b request from S08 Metrics Service"""
+        # Receive request
+        if not message:
+            return
+        
+        request_data = message
+        request_id = request_data.get('id', "")
+        method_name = str(request_data.get('method', ""))
+        
+        print(f"[S01] Received A03b request: {method_name} (id: {request_id})")
+        
+        # Process request
+        response = self._handle_a03b_request_INTERNAL(method_name, request_data.get('params', {}))
+        response['id'] = request_id
+        
+        # Send response
+        with self.mq_lock:
+            mq_resp = self.mq_service.clone()
+        mq_resp.declare_queue(self.a03b_response_queue)
+        mq_resp.publish_message(self.a03b_response_queue, response)
+        
+        print(f"[S01] Sent A03b response for request {request_id}")
+    
+    def _handle_a03b_request_INTERNAL(self, method: str, params: dict) -> dict:
         """Handle A03b method requests from S08"""
         try:
             if method == 'get_conversation_statistics':

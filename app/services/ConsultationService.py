@@ -752,10 +752,11 @@ class ConsultationService:
         """Handle A02 streaming response from S02 AI Agent"""
         request_id = message.get('id')
         result = message.get('result')
+
+        print(f"[S01] Received A02 response for request_id {request_id}: {result}")
         
         if not result:
             print(f"[S01] Invalid A02 response: missing result")
-            print(f"Full message: {message}")
             return
         
         with self.pending_requests_lock:

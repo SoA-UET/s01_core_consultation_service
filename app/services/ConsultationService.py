@@ -216,7 +216,7 @@ class ConsultationService:
                 
                 return jsonify({
                     'content': [
-                        {**dict(c), 'id': str(c['_id'])}
+                        {**dict(c), '_id': str(c['_id']), 'id': str(c['_id'])}
                         for c in conversations
                     ]
                 })

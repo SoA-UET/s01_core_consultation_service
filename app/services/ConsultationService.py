@@ -1,6 +1,7 @@
 import json
 import os
 import threading
+import time
 import uuid
 from datetime import datetime
 from typing import Any, Optional
@@ -625,7 +626,8 @@ class ConsultationService:
         # Send to S02 for AI response
         def ai_response_thread():
             try:
-                request_id = str(uuid.uuid4())
+                # Use conversation_id as request_id for simplicity
+                request_id = conversation_id
                 
                 # Prepare A02 request according to spec
                 history_messages = self._get_conversation_history(conversation_id)
@@ -664,25 +666,17 @@ class ConsultationService:
                 mq.declare_queue(self.a02_request_queue)
                 mq.publish_message(self.a02_request_queue, a02_request)
                 
-                # Wait for response or timeout
-                # Since A02 streams multiple messages, we wait for either:
-                # 1. An error (event will be set)
-                # 2. Timeout (indicating streaming is complete)
-                stream_timeout = 2.0  # Short timeout between chunks
-                start_time = datetime.utcnow()
-                max_wait = 60.0  # Maximum total wait time
-                
-                while (datetime.utcnow() - start_time).total_seconds() < max_wait:
-                    if response_event.wait(timeout=stream_timeout):
-                        # Event was set (likely an error)
-                        break
-                    
-                    # Check if we received any content recently
-                    if response_data.get('last_chunk_time'):
-                        time_since_last = (datetime.utcnow() - response_data['last_chunk_time']).total_seconds()
-                        if time_since_last > stream_timeout:
-                            # No chunks for a while, consider streaming complete
-                            break
+                # Wait for streaming to complete
+                # Event will be set when:
+                # 1. An error occurs
+                # 2. Empty content is received (end-of-stream marker)
+                if not response_event.wait(timeout=60.0):
+                    print(f"[S01] Timeout waiting for A02 response for conversation {conversation_id}")
+                    with self.pending_requests_lock:
+                        if request_id in self.pending_requests:
+                            del self.pending_requests[request_id]
+                    self.socketio.emit('error', {'message': 'AI Agent timeout'}, room=conversation_id)
+                    return
                 
                 # Clean up pending request
                 with self.pending_requests_lock:
@@ -699,19 +693,15 @@ class ConsultationService:
                         self.socketio.emit('error', {'message': error_content}, room=conversation_id)
                     return
                 
-                # End streaming
-                if response_data.get('stream_started'):
-                    self.socketio.emit('text_stop', {}, room=conversation_id)
-                
-                # Get accumulated response content
+                # Get accumulated response content and save
                 ai_response_text = response_data.get('accumulated_content', '')
                 if ai_response_text:
                     # Save AI message (streaming already happened in real-time)
                     self._save_ai_message(conversation_id, ai_response_text)
+                    print(f"[S01] Saved AI response for conversation {conversation_id}")
                 else:
-                    # No content received
-                    print(f"[S01] No AI response content received for conversation {conversation_id}")
-                    self.socketio.emit('error', {'message': 'No response from AI Agent'}, room=conversation_id)
+                    # No content received - this shouldn't happen if protocol is followed
+                    print(f"[S01] Warning: No AI response content for conversation {conversation_id}")
             
             except Exception as e:
                 print(f"[S01] Error in AI response thread: {e}")
@@ -810,6 +800,8 @@ class ConsultationService:
         result = message.get('result')
         
         if not result:
+            print(f"[S01] Invalid A02 response: missing result")
+            print(f"Full message: {message}")
             return
         
         with self.pending_requests_lock:
@@ -830,21 +822,38 @@ class ConsultationService:
                 # Handle streaming success response
                 conversation_id = pending.get('conversation_id')
                 
-                # Accumulate content
+                # Check if content is empty - this signals end of stream
+                if content == '':
+                    # End of stream marker
+                    print(f"[S01] A02 streaming complete for conversation {conversation_id}")
+                    if pending['data'].get('stream_started'):
+                        self.socketio.emit('text_stop', {
+                            'conversation_id': conversation_id
+                        }, room=conversation_id)
+                    pending['event'].set()
+                    # Note: Don't delete here, let the waiting thread clean up
+                    return
+                
+                # Accumulate non-empty content
                 pending['data']['accumulated_content'] += content
-                pending['data']['last_chunk_time'] = datetime.utcnow()
                 
                 # Stream to frontend immediately
                 if conversation_id:
                     # Send chunk to frontend
                     if not pending['data'].get('stream_started'):
-                        self.socketio.emit('text_start', {}, room=conversation_id)
+                        self.socketio.emit('text_start', {
+                            'conversation_id': conversation_id
+                        }, room=conversation_id)
                         pending['data']['stream_started'] = True
                     
-                    self.socketio.emit('text_chunk', {'chunk': content}, room=conversation_id)
-                
-                # Streaming continues - don't set event or delete the request
-                # The waiting thread will detect completion via timeout
+                    self.socketio.emit('text_chunk', {
+                        'conversation_id': conversation_id,
+                        'timestamp': int(time.time() * 1000),
+                        'sender_type': 'AI_AGENT',
+                        'sender_id': None,
+                        'sender_name': None,
+                        'content': content
+                    }, room=conversation_id)
     
     def _consume_a36b_events(self):
         """Consumer for A36b events from S19"""
@@ -946,12 +955,20 @@ class ConsultationService:
             response_status = content.get('status')
             
             if response_status == 'accepted':
+                # Get current status before update
+                conversation = conversations_collection.find_one({'_id': ObjectId(conversation_id)})
+                old_status = conversation.get('status') if conversation else 'FORWARDING'
+                
                 # Update status to HUMAN_AGENT_TEXTING
                 conversations_collection.update_one(
                     {'_id': ObjectId(conversation_id)},
                     {'$set': {'status': 'HUMAN_AGENT_TEXTING', 'updated_at': datetime.utcnow()}}
                 )
-                self.socketio.emit('status_switch', {'status': 'HUMAN_AGENT_TEXTING'}, room=conversation_id)
+                self.socketio.emit('status_switch', {
+                    'conversation_id': conversation_id,
+                    'old_status': old_status,
+                    'new_status': 'HUMAN_AGENT_TEXTING'
+                }, room=conversation_id)
                 print(f"[S01] Conversation {conversation_id} switched to HUMAN_AGENT_TEXTING")
             else:
                 # Rejected, revert to AI_AGENT_TEXTING
@@ -1002,7 +1019,11 @@ class ConsultationService:
             {'_id': ObjectId(conversation_id)},
             {'$set': {'status': 'FORWARDING', 'updated_at': datetime.utcnow()}}
         )
-        self.socketio.emit('status_switch', {'status': 'FORWARDING'}, room=conversation_id)
+        self.socketio.emit('status_switch', {
+            'conversation_id': conversation_id,
+            'old_status': old_status,
+            'new_status': 'FORWARDING'
+        }, room=conversation_id)
         
         # Send status update event to S08
         if old_status and old_status != 'FORWARDING':
@@ -1012,6 +1033,10 @@ class ConsultationService:
     
     def _revert_to_ai_agent(self, conversation_id: str):
         """Revert conversation status to AI_AGENT_TEXTING"""
+        # Get current status before update
+        conversation = conversations_collection.find_one({'_id': ObjectId(conversation_id)})
+        old_status = conversation.get('status') if conversation else 'FORWARDING'
+        
         conversations_collection.update_one(
             {'_id': ObjectId(conversation_id)},
             {'$set': {'status': 'AI_AGENT_TEXTING', 'updated_at': datetime.utcnow()}}
@@ -1027,19 +1052,34 @@ class ConsultationService:
         }
         messages_collection.insert_one(msg)
         self.socketio.emit('new_message', self._serialize_message(msg), room=conversation_id)
-        self.socketio.emit('status_switch', {'status': 'AI_AGENT_TEXTING'}, room=conversation_id)
+        self.socketio.emit('status_switch', {
+            'conversation_id': conversation_id,
+            'old_status': old_status,
+            'new_status': 'AI_AGENT_TEXTING'
+        }, room=conversation_id)
     
     def _stream_ai_response(self, conversation_id: str, response_text: str):
         """Stream AI response in chunks"""
-        self.socketio.emit('text_start', {}, room=conversation_id)
+        self.socketio.emit('text_start', {
+            'conversation_id': conversation_id
+        }, room=conversation_id)
         
         # Stream in chunks of 50 characters
         chunk_size = 50
         for i in range(0, len(response_text), chunk_size):
             chunk = response_text[i:i+chunk_size]
-            self.socketio.emit('text_chunk', {'chunk': chunk}, room=conversation_id)
+            self.socketio.emit('text_chunk', {
+                'conversation_id': conversation_id,
+                'timestamp': int(time.time() * 1000),
+                'sender_type': 'AI_AGENT',
+                'sender_id': None,
+                'sender_name': None,
+                'content': chunk
+            }, room=conversation_id)
         
-        self.socketio.emit('text_stop', {}, room=conversation_id)
+        self.socketio.emit('text_stop', {
+            'conversation_id': conversation_id
+        }, room=conversation_id)
     
     def _save_ai_message(self, conversation_id: str, content: str):
         """Save AI agent message"""

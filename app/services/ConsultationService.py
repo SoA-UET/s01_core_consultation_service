@@ -172,12 +172,11 @@ class ConsultationService:
                 self._send_conversation_start_event(conversation['id'], customer_id, None)
                 
                 return jsonify({
-                    'status': 'success',
-                    'data': self._serialize_conversation(conversation)
+                    'content': self._serialize_conversation(conversation)
                 }), 201
             except Exception as e:
                 print(f"[S01] Error creating conversation: {e}")
-                return jsonify({'status': 'error', 'message': str(e)}), 500
+                return jsonify({'error': str(e)}), 500
         
         @self.app.route('/api/v1/conversations/<conversation_id>', methods=['GET'])
         @jwt_required
@@ -193,15 +192,14 @@ class ConsultationService:
                     'customer_id': customer_id  # Ensure user can only access their own conversations
                 })
                 if not conversation:
-                    return jsonify({'status': 'error', 'message': 'Conversation not found'}), 404
+                    return jsonify({'error': 'Conversation not found'}), 404
                 
                 return jsonify({
-                    'status': 'success',
-                    'data': self._serialize_conversation(conversation)
+                    'content': self._serialize_conversation(conversation)
                 })
             except Exception as e:
                 print(f"[S01] Error getting conversation: {e}")
-                return jsonify({'status': 'error', 'message': str(e)}), 500
+                return jsonify({'error': str(e)}), 500
         
         @self.app.route('/api/v1/conversations', methods=['GET'])
         @jwt_required
@@ -217,17 +215,19 @@ class ConsultationService:
                 ).sort('updated_at', -1))
                 
                 return jsonify({
-                    'status': 'success',
-                    'data': [self._serialize_conversation(c) for c in conversations]
+                    'content': [
+                        {'id': str(c['_id']), 'title': c.get('title', 'Untitled')}
+                        for c in conversations
+                    ]
                 })
             except Exception as e:
                 print(f"[S01] Error listing conversations: {e}")
-                return jsonify({'status': 'error', 'message': str(e)}), 500
+                return jsonify({'error': str(e)}), 500
         
         @self.app.route('/api/v1/conversations/<conversation_id>/messages', methods=['GET'])
         @jwt_required
         def get_messages(conversation_id):
-            """Get all messages in a conversation"""
+            """Get all messages in a conversation with pagination"""
             try:
                 # Extract customer_id from JWT and verify ownership
                 jwt_payload = request.jwt_payload
@@ -239,24 +239,38 @@ class ConsultationService:
                     'customer_id': customer_id
                 })
                 if not conversation:
-                    return jsonify({'status': 'error', 'message': 'Conversation not found'}), 404
+                    return jsonify({'error': 'Conversation not found'}), 404
                 
-                messages = list(messages_collection.find(
-                    {'conversation_id': conversation_id}
-                ).sort('created_at', 1))
+                # Get pagination parameters
+                page_number = request.args.get('pageNumber', type=int)
+                page_size = request.args.get('pageSize', type=int)
+                search = request.args.get('search', type=str)
+                
+                # Build query
+                query = {'conversation_id': conversation_id}
+                if search:
+                    query['content'] = {'$regex': search, '$options': 'i'}
+                
+                # Get messages with optional pagination
+                messages_query = messages_collection.find(query).sort('created_at', 1)
+                
+                if page_number is not None and page_size is not None:
+                    skip = (page_number - 1) * page_size if page_number > 0 else 0
+                    messages_query = messages_query.skip(skip).limit(page_size)
+                
+                messages = list(messages_query)
                 
                 return jsonify({
-                    'status': 'success',
-                    'data': [self._serialize_message(m) for m in messages]
+                    'content': [self._serialize_message(m) for m in messages]
                 })
             except Exception as e:
                 print(f"[S01] Error getting messages: {e}")
-                return jsonify({'status': 'error', 'message': str(e)}), 500
+                return jsonify({'error': str(e)}), 500
         
-        @self.app.route('/api/v1/conversations/<conversation_id>/reviews', methods=['POST'])
+        @self.app.route('/api/v1/conversations/<conversation_id>/messages', methods=['POST'])
         @jwt_required
-        def create_review(conversation_id):
-            """Create a review for a conversation"""
+        def send_message(conversation_id):
+            """Send a text message from customer to consultant"""
             try:
                 # Extract customer_id from JWT and verify ownership
                 jwt_payload = request.jwt_payload
@@ -268,27 +282,115 @@ class ConsultationService:
                     'customer_id': customer_id
                 })
                 if not conversation:
-                    return jsonify({'status': 'error', 'message': 'Conversation not found'}), 404
+                    return jsonify({'error': 'Conversation not found'}), 404
+                
+                data = request.json or {}
+                content = data.get('content')
+                
+                if not content:
+                    return jsonify({'error': 'Content is required'}), 400
+                
+                # Save customer message
+                message = {
+                    'conversation_id': conversation_id,
+                    'sender_type': 'CUSTOMER',
+                    'sender_id': customer_id,
+                    'sender_name': jwt_payload.get('full_name'),
+                    'content': content,
+                    'emotion': 'Neutral',
+                    'created_at': datetime.utcnow()
+                }
+                result = messages_collection.insert_one(message)
+                message['id'] = str(result.inserted_id)
+                
+                # Route based on conversation status
+                status = conversation.get('status')
+                if status == 'AI_AGENT_TEXTING':
+                    self._handle_ai_agent_text_message(conversation, message)
+                elif status == 'FORWARDING':
+                    self._handle_forwarding_message(conversation, message)
+                elif status == 'HUMAN_AGENT_TEXTING':
+                    self._handle_human_agent_text_message(conversation, message)
+                
+                return jsonify({
+                    'content': self._serialize_message(message)
+                }), 201
+            except Exception as e:
+                print(f"[S01] Error sending message: {e}")
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/api/v1/conversations/<conversation_id>/rating', methods=['GET'])
+        @jwt_required
+        def get_rating(conversation_id):
+            """Get the current service quality rating"""
+            try:
+                # Extract customer_id from JWT and verify ownership
+                jwt_payload = request.jwt_payload
+                customer_id = jwt_payload['sub']
+                
+                # Check conversation ownership
+                conversation = conversations_collection.find_one({
+                    '_id': ObjectId(conversation_id),
+                    'customer_id': customer_id
+                })
+                if not conversation:
+                    return jsonify({'error': 'Conversation not found'}), 404
+                
+                # Find rating
+                review = reviews_collection.find_one({'conversation_id': conversation_id})
+                
+                if not review:
+                    return jsonify({'error': 'Rating not found'}), 404
+                
+                return jsonify({
+                    'conversation_id': conversation_id,
+                    'rating': review.get('rating'),
+                    'comment': review.get('comment', '')
+                })
+            except Exception as e:
+                print(f"[S01] Error getting rating: {e}")
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/api/v1/conversations/<conversation_id>/rating', methods=['PUT'])
+        @jwt_required
+        def submit_rating(conversation_id):
+            """Submit or modify service quality rating"""
+            try:
+                # Extract customer_id from JWT and verify ownership
+                jwt_payload = request.jwt_payload
+                customer_id = jwt_payload['sub']
+                
+                # Check conversation ownership
+                conversation = conversations_collection.find_one({
+                    '_id': ObjectId(conversation_id),
+                    'customer_id': customer_id
+                })
+                if not conversation:
+                    return jsonify({'error': 'Conversation not found'}), 404
                 
                 data = request.json or {}
                 rating = data.get('rating')
                 comment = data.get('comment', '')
                 
                 if not rating or rating < 1 or rating > 5:
-                    return jsonify({'status': 'error', 'message': 'Invalid rating'}), 400
+                    return jsonify({'error': 'Rating must be between 1 and 5'}), 400
                 
-                # Check if review already exists
+                # Check if review exists
                 existing = reviews_collection.find_one({'conversation_id': conversation_id})
-                if existing:
-                    return jsonify({'status': 'error', 'message': 'Review already exists'}), 400
+                old_rating = existing.get('rating') if existing else None
                 
+                # Upsert review
                 review = {
                     'conversation_id': conversation_id,
                     'rating': rating,
                     'comment': comment
                 }
                 
-                reviews_collection.insert_one(review)
+                reviews_collection.update_one(
+                    {'conversation_id': conversation_id},
+                    {'$set': review},
+                    upsert=True
+                )
                 
                 # Update customer_satisfaction in conversation
                 conversations_collection.update_one(
@@ -296,16 +398,65 @@ class ConsultationService:
                     {'$set': {'customer_satisfaction': rating, 'updated_at': datetime.utcnow()}}
                 )
                 
+                # Get partner_id
+                partner_id = conversation.get('partner_id')
+                
                 # Send customer_satisfaction_changed event to S08
-                self._send_customer_satisfaction_changed_event(conversation_id, None, None, rating)
+                self._send_customer_satisfaction_changed_event(conversation_id, partner_id, old_rating, rating)
                 
                 # Notify S19 via A36a event rating_changed
-                self._send_rating_changed_event(conversation_id, None, rating)
+                self._send_rating_changed_event(conversation_id, old_rating, rating)
                 
-                return jsonify({'status': 'success'}), 201
+                return jsonify({
+                    'conversation_id': conversation_id,
+                    'rating': rating,
+                    'comment': comment
+                })
             except Exception as e:
-                print(f"[S01] Error creating review: {e}")
-                return jsonify({'status': 'error', 'message': str(e)}), 500
+                print(f"[S01] Error submitting rating: {e}")
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/api/v1/conversations/<conversation_id>/audio', methods=['POST'])
+        @jwt_required
+        def submit_audio(conversation_id):
+            """Submit whole audio input from customer in AI Agent mode"""
+            try:
+                # Extract customer_id from JWT and verify ownership
+                jwt_payload = request.jwt_payload
+                customer_id = jwt_payload['sub']
+                
+                # Check conversation ownership
+                conversation = conversations_collection.find_one({
+                    '_id': ObjectId(conversation_id),
+                    'customer_id': customer_id
+                })
+                if not conversation:
+                    return jsonify({'error': 'Conversation not found'}), 404
+                
+                # Validate conversation status
+                if conversation.get('status') != 'AI_AGENT_CALLING':
+                    return jsonify({'error': 'Audio upload only allowed in AI_AGENT_CALLING status'}), 400
+                
+                # Check if file is present
+                if 'file' not in request.files:
+                    return jsonify({'error': 'No audio file provided'}), 400
+                
+                audio_file = request.files['file']
+                if audio_file.filename == '':
+                    return jsonify({'error': 'No audio file selected'}), 400
+                
+                # Read audio data
+                audio_data = audio_file.read()
+                
+                # TODO: Submit to S20 Speech Service for processing via A38
+                # For now, just accept the file
+                print(f"[S01] Received audio file for conversation {conversation_id}, size: {len(audio_data)} bytes")
+                
+                # Return 202 Accepted with empty body
+                return '', 202
+            except Exception as e:
+                print(f"[S01] Error submitting audio: {e}")
+                return jsonify({'error': str(e)}), 500
     
     # ===== SocketIO Handlers =====
     

@@ -14,7 +14,7 @@ if not MONGO_URL:
 client = MongoClient(MONGO_URL)
 db = client.get_default_database()
 
-# NOTE: Change collection names as appropriate.
-
+# S01 - Consultation Service Collections
 conversations_collection = db.conversations
 messages_collection = db.messages
+reviews_collection = db.reviews

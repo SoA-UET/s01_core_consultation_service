@@ -627,20 +627,29 @@ class ConsultationService:
             try:
                 request_id = str(uuid.uuid4())
                 
-                # Prepare A02 request
+                # Prepare A02 request according to spec
+                history_messages = self._get_conversation_history(conversation_id)
+                history_str = "\n".join([
+                    f"{m['role'].capitalize()}: {m['content']}" 
+                    for m in history_messages
+                ])
+                
                 a02_request = {
-                    'id': request_id,
-                    'method': 'generate_response',
+                    'method': 'handle_inquiry',
                     'params': {
-                        'conversation_id': conversation_id,
-                        'message': customer_message['content'],
-                        'conversation_history': self._get_conversation_history(conversation_id)
-                    }
+                        'inquiry': customer_message['content'],
+                        'history': history_str
+                    },
+                    'id': request_id
                 }
                 
-                # Setup response handler
+                # Setup response handler for streaming responses
                 response_event = threading.Event()
-                response_data = {'result': None}
+                response_data = {
+                    'result': None,
+                    'accumulated_content': '',
+                    'has_error': False
+                }
                 
                 with self.pending_requests_lock:
                     self.pending_requests[request_id] = {
@@ -655,30 +664,54 @@ class ConsultationService:
                 mq.declare_queue(self.a02_request_queue)
                 mq.publish_message(self.a02_request_queue, a02_request)
                 
-                # Wait for response
-                if not response_event.wait(timeout=60):
-                    print(f"[S01] Timeout waiting for A02 response")
-                    self.socketio.emit('error', {'message': 'AI Agent timeout'}, room=conversation_id)
-                    return
+                # Wait for response or timeout
+                # Since A02 streams multiple messages, we wait for either:
+                # 1. An error (event will be set)
+                # 2. Timeout (indicating streaming is complete)
+                stream_timeout = 2.0  # Short timeout between chunks
+                start_time = datetime.utcnow()
+                max_wait = 60.0  # Maximum total wait time
                 
-                result = response_data['result']
-                if not result:
-                    return
+                while (datetime.utcnow() - start_time).total_seconds() < max_wait:
+                    if response_event.wait(timeout=stream_timeout):
+                        # Event was set (likely an error)
+                        break
+                    
+                    # Check if we received any content recently
+                    if response_data.get('last_chunk_time'):
+                        time_since_last = (datetime.utcnow() - response_data['last_chunk_time']).total_seconds()
+                        if time_since_last > stream_timeout:
+                            # No chunks for a while, consider streaming complete
+                            break
                 
-                if result.get('status') == 'error':
-                    content = result.get('content', '')
-                    if content == 'FORWARD':
+                # Clean up pending request
+                with self.pending_requests_lock:
+                    if request_id in self.pending_requests:
+                        del self.pending_requests[request_id]
+                
+                # Check for errors
+                if response_data.get('has_error'):
+                    error_content = response_data.get('error_content', '')
+                    if error_content == 'FORWARD':
                         # AI can't answer, switch to FORWARDING
                         self._switch_to_forwarding_status(conversation_id)
                     else:
-                        self.socketio.emit('error', {'message': content}, room=conversation_id)
-                else:
-                    # Stream AI response
-                    ai_response_text = result.get('content', {}).get('response', '')
-                    self._stream_ai_response(conversation_id, ai_response_text)
-                    
-                    # Save AI message
+                        self.socketio.emit('error', {'message': error_content}, room=conversation_id)
+                    return
+                
+                # End streaming
+                if response_data.get('stream_started'):
+                    self.socketio.emit('text_stop', {}, room=conversation_id)
+                
+                # Get accumulated response content
+                ai_response_text = response_data.get('accumulated_content', '')
+                if ai_response_text:
+                    # Save AI message (streaming already happened in real-time)
                     self._save_ai_message(conversation_id, ai_response_text)
+                else:
+                    # No content received
+                    print(f"[S01] No AI response content received for conversation {conversation_id}")
+                    self.socketio.emit('error', {'message': 'No response from AI Agent'}, room=conversation_id)
             
             except Exception as e:
                 print(f"[S01] Error in AI response thread: {e}")
@@ -772,18 +805,46 @@ class ConsultationService:
         mq.start_consuming()
     
     def _handle_a02_response(self, message: dict):
-        """Handle A02 response from S02 AI Agent"""
+        """Handle A02 streaming response from S02 AI Agent"""
         request_id = message.get('id')
         result = message.get('result')
+        
+        if not result:
+            return
         
         with self.pending_requests_lock:
             pending = self.pending_requests.get(request_id)
             if not pending:
                 return
             
-            pending['data']['result'] = result
-            pending['event'].set()
-            del self.pending_requests[request_id]
+            status = result.get('status')
+            content = result.get('content', '')
+            
+            if status == 'error':
+                # Handle error response
+                pending['data']['has_error'] = True
+                pending['data']['error_content'] = content
+                pending['event'].set()
+                # Note: Don't delete here, let the waiting thread clean up
+            elif status == 'success':
+                # Handle streaming success response
+                conversation_id = pending.get('conversation_id')
+                
+                # Accumulate content
+                pending['data']['accumulated_content'] += content
+                pending['data']['last_chunk_time'] = datetime.utcnow()
+                
+                # Stream to frontend immediately
+                if conversation_id:
+                    # Send chunk to frontend
+                    if not pending['data'].get('stream_started'):
+                        self.socketio.emit('text_start', {}, room=conversation_id)
+                        pending['data']['stream_started'] = True
+                    
+                    self.socketio.emit('text_chunk', {'chunk': content}, room=conversation_id)
+                
+                # Streaming continues - don't set event or delete the request
+                # The waiting thread will detect completion via timeout
     
     def _consume_a36b_events(self):
         """Consumer for A36b events from S19"""

@@ -12,6 +12,7 @@ from bson import ObjectId
 
 from .MessageQueueService import MessageQueueService
 from ..collections import conversations_collection, messages_collection, reviews_collection
+from ..utils.jwt_auth import init_jwt_auth, jwt_required, jwt_optional
 
 # Load environment variables
 load_dotenv()
@@ -76,6 +77,12 @@ class ConsultationService:
         self.active_sessions: dict[str, dict] = {}  # {session_id: {conversation_id, customer_id, ...}}
         self.sessions_lock = threading.Lock()
         
+        # Initialize JWT authentication
+        identity_service_url = os.getenv('IDENTITY_SERVICE_URL', 'http://localhost:5004')
+        jwks_ttl_minutes = int(os.getenv('JWKS_TTL_IN_MINUTES', '10'))
+        init_jwt_auth(identity_service_url, jwks_ttl_minutes)
+        print(f"[S01] JWT authentication initialized with Identity Service: {identity_service_url}")
+        
         # Register HTTP routes
         self._register_http_routes()
         
@@ -120,12 +127,15 @@ class ConsultationService:
         """Register HTTP API routes"""
         
         @self.app.route('/api/v1/conversations', methods=['POST'])
+        @jwt_required
         def create_conversation():
             """Create a new conversation"""
             try:
-                # TODO: Extract customer_id from JWT token
+                # Extract customer_id from JWT token
+                jwt_payload = request.jwt_payload
+                customer_id = jwt_payload['sub']
+                
                 data = request.json or {}
-                customer_id = data.get('customer_id', 'test_customer')
                 title = data.get('title', 'New Conversation')
                 
                 conversation = {
@@ -152,10 +162,18 @@ class ConsultationService:
                 return jsonify({'status': 'error', 'message': str(e)}), 500
         
         @self.app.route('/api/v1/conversations/<conversation_id>', methods=['GET'])
+        @jwt_required
         def get_conversation(conversation_id):
             """Get conversation details"""
             try:
-                conversation = conversations_collection.find_one({'_id': ObjectId(conversation_id)})
+                # Extract customer_id from JWT
+                jwt_payload = request.jwt_payload
+                customer_id = jwt_payload['sub']
+                
+                conversation = conversations_collection.find_one({
+                    '_id': ObjectId(conversation_id),
+                    'customer_id': customer_id  # Ensure user can only access their own conversations
+                })
                 if not conversation:
                     return jsonify({'status': 'error', 'message': 'Conversation not found'}), 404
                 
@@ -168,11 +186,13 @@ class ConsultationService:
                 return jsonify({'status': 'error', 'message': str(e)}), 500
         
         @self.app.route('/api/v1/conversations', methods=['GET'])
+        @jwt_required
         def list_conversations():
             """List all conversations for a customer"""
             try:
-                # TODO: Extract customer_id from JWT
-                customer_id = request.args.get('customer_id', 'test_customer')
+                # Extract customer_id from JWT
+                jwt_payload = request.jwt_payload
+                customer_id = jwt_payload['sub']
                 
                 conversations = list(conversations_collection.find(
                     {'customer_id': customer_id}
@@ -187,9 +207,22 @@ class ConsultationService:
                 return jsonify({'status': 'error', 'message': str(e)}), 500
         
         @self.app.route('/api/v1/conversations/<conversation_id>/messages', methods=['GET'])
+        @jwt_required
         def get_messages(conversation_id):
             """Get all messages in a conversation"""
             try:
+                # Extract customer_id from JWT and verify ownership
+                jwt_payload = request.jwt_payload
+                customer_id = jwt_payload['sub']
+                
+                # Check conversation ownership
+                conversation = conversations_collection.find_one({
+                    '_id': ObjectId(conversation_id),
+                    'customer_id': customer_id
+                })
+                if not conversation:
+                    return jsonify({'status': 'error', 'message': 'Conversation not found'}), 404
+                
                 messages = list(messages_collection.find(
                     {'conversation_id': conversation_id}
                 ).sort('created_at', 1))
@@ -203,9 +236,22 @@ class ConsultationService:
                 return jsonify({'status': 'error', 'message': str(e)}), 500
         
         @self.app.route('/api/v1/conversations/<conversation_id>/reviews', methods=['POST'])
+        @jwt_required
         def create_review(conversation_id):
             """Create a review for a conversation"""
             try:
+                # Extract customer_id from JWT and verify ownership
+                jwt_payload = request.jwt_payload
+                customer_id = jwt_payload['sub']
+                
+                # Check conversation ownership
+                conversation = conversations_collection.find_one({
+                    '_id': ObjectId(conversation_id),
+                    'customer_id': customer_id
+                })
+                if not conversation:
+                    return jsonify({'status': 'error', 'message': 'Conversation not found'}), 404
+                
                 data = request.json or {}
                 rating = data.get('rating')
                 comment = data.get('comment', '')
@@ -247,8 +293,54 @@ class ConsultationService:
         
         @self.socketio.on('connect')
         def handle_connect():
-            print(f"[S01] Client connected: {request.sid}")
-            emit('connected', {'message': 'Connected to Consultation Service'})
+            """Handle client connection with JWT authentication"""
+            # Extract JWT from query parameters or headers
+            token = None
+            
+            # Try to get from query parameters
+            if 'token' in request.args:
+                token = request.args.get('token')
+            # Try to get from Authorization header
+            elif 'Authorization' in request.headers:
+                auth_header = request.headers.get('Authorization')
+                parts = auth_header.split()
+                if len(parts) == 2 and parts[0].lower() == 'bearer':
+                    token = parts[1]
+            
+            if not token:
+                print(f"[S01] Client connection rejected: No token provided")
+                return False  # Reject connection
+            
+            # Verify JWT
+            from ..utils.jwt_auth import get_authenticator
+            authenticator = get_authenticator()
+            if not authenticator:
+                print(f"[S01] Client connection rejected: Auth system not available")
+                return False
+            
+            payload = authenticator.verify_jwt(token)
+            if not payload:
+                print(f"[S01] Client connection rejected: Invalid token")
+                return False
+            
+            # Store JWT payload in session
+            with self.sessions_lock:
+                self.active_sessions[request.sid] = {
+                    'jwt_payload': payload,
+                    'customer_id': payload['sub'],
+                    'full_name': payload['full_name'],
+                    'email': payload['email']
+                }
+            
+            print(f"[S01] Client connected: {request.sid} (user: {payload['sub']})")
+            emit('connected', {
+                'message': 'Connected to Consultation Service',
+                'user': {
+                    'id': payload['sub'],
+                    'full_name': payload['full_name'],
+                    'email': payload['email']
+                }
+            })
         
         @self.socketio.on('disconnect')
         def handle_disconnect():
@@ -261,27 +353,53 @@ class ConsultationService:
         @self.socketio.on('join_conversation')
         def handle_join_conversation(data):
             """Join a conversation room"""
+            # Get session info
+            with self.sessions_lock:
+                session = self.active_sessions.get(request.sid)
+            
+            if not session:
+                emit('error', {'message': 'Not authenticated'})
+                return
+            
+            customer_id = session['customer_id']
             conversation_id = data.get('conversation_id')
-            customer_id = data.get('customer_id')  # TODO: Extract from JWT
             
             if not conversation_id:
                 emit('error', {'message': 'conversation_id required'})
                 return
             
+            # Verify conversation ownership
+            conversation = conversations_collection.find_one({
+                '_id': ObjectId(conversation_id),
+                'customer_id': customer_id
+            })
+            if not conversation:
+                emit('error', {'message': 'Conversation not found or access denied'})
+                return
+            
             join_room(conversation_id)
             
+            # Update session with conversation_id
             with self.sessions_lock:
-                self.active_sessions[request.sid] = {
-                    'conversation_id': conversation_id,
-                    'customer_id': customer_id
-                }
+                self.active_sessions[request.sid]['conversation_id'] = conversation_id
             
-            print(f"[S01] Client {request.sid} joined conversation {conversation_id}")
+            print(f"[S01] Client {request.sid} (user: {customer_id}) joined conversation {conversation_id}")
             emit('joined', {'conversation_id': conversation_id})
         
         @self.socketio.on('send_message')
         def handle_send_message(data):
             """Handle incoming message from customer"""
+            # Get session info
+            with self.sessions_lock:
+                session = self.active_sessions.get(request.sid)
+            
+            if not session:
+                emit('error', {'message': 'Not authenticated'})
+                return
+            
+            customer_id = session['customer_id']
+            customer_name = session['full_name']
+            
             conversation_id = data.get('conversation_id')
             content = data.get('content')
             
@@ -289,10 +407,13 @@ class ConsultationService:
                 emit('error', {'message': 'conversation_id and content required'})
                 return
             
-            # Get conversation
-            conversation = conversations_collection.find_one({'_id': ObjectId(conversation_id)})
+            # Get conversation and verify ownership
+            conversation = conversations_collection.find_one({
+                '_id': ObjectId(conversation_id),
+                'customer_id': customer_id
+            })
             if not conversation:
-                emit('error', {'message': 'Conversation not found'})
+                emit('error', {'message': 'Conversation not found or access denied'})
                 return
             
             status = conversation.get('status')
@@ -301,8 +422,8 @@ class ConsultationService:
             message = {
                 'conversation_id': conversation_id,
                 'sender_type': 'CUSTOMER',
-                'sender_id': None,
-                'sender_name': None,
+                'sender_id': customer_id,
+                'sender_name': customer_name,
                 'content': content,
                 'emotion': 'Neutral',
                 'created_at': datetime.utcnow()

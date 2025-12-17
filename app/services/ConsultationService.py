@@ -1344,12 +1344,6 @@ class ConsultationService:
         
         with self.mq_lock:
             mq = self.mq_service.clone()
-        mq.declare_queue(self.a02_response_queue)
-        mq.register_callback(self.a02_response_queue, self._handle_a02_response)
-        mq.start_consuming()
-
-        with self.mq_lock:
-            mq = self.mq_service.clone()
         mq.declare_queue(self.a03b_request_queue)
         mq.register_callback(self.a03b_request_queue, self._handle_a03b_request)
         mq.start_consuming()

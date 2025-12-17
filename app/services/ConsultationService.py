@@ -464,20 +464,20 @@ class ConsultationService:
         """Register SocketIO event handlers"""
         
         @self.socketio.on('connect')
-        def handle_connect():
+        def handle_connect(auth):
             """Handle client connection with JWT authentication"""
             # Extract JWT from query parameters or headers
             token = None
             
             # Try to get from query parameters
-            if 'token' in request.args:
-                token = request.args.get('token')
+            if auth and 'token' in auth:
+                token = auth.get('token')
             # Try to get from Authorization header
-            elif 'Authorization' in request.headers:
-                auth_header = request.headers.get('Authorization')
-                parts = auth_header.split()
-                if len(parts) == 2 and parts[0].lower() == 'bearer':
-                    token = parts[1]
+            # elif 'Authorization' in request.headers:
+            #     auth_header = request.headers.get('Authorization')
+            #     parts = auth_header.split()
+            #     if len(parts) == 2 and parts[0].lower() == 'bearer':
+            #         token = parts[1]
             
             if not token:
                 print(f"[S01] Client connection rejected: No token provided")

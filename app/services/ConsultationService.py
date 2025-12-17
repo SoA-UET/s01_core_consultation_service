@@ -652,7 +652,11 @@ class ConsultationService:
                     'accumulated_content': '',
                     'has_error': False,
                     'error_content': '',
-                    'stream_started': False
+                    'stream_started': False,
+                    'buffered_messages': {},  # seq -> content mapping for out-of-order messages
+                    'next_seq_to_emit': 0,  # next sequence number we're waiting for
+                    'total_messages': None,  # total number of messages (known when empty content arrives)
+                    'received_count': 0  # count of received messages
                 }
             }
         
@@ -762,10 +766,12 @@ class ConsultationService:
         with self.pending_requests_lock:
             pending = self.pending_requests.get(request_id)
             if not pending:
+                print(f"[S01] No pending request found for {request_id}")
                 return
             
             status = result.get('status')
             content = result.get('content', '')
+            seq = result.get('seq', 0)
             
             if status == 'error':
                 # Handle error response
@@ -825,7 +831,23 @@ class ConsultationService:
                 
                 # Check if content is empty - this signals end of stream
                 if content == '':
-                    # End of stream marker
+                    # End of stream marker - we now know the total number of messages
+                    pending['data']['total_messages'] = seq + 1  # seq is 0-indexed
+                    print(f"[S01] A02 end marker received for conversation {conversation_id}, total messages: {seq + 1}")
+                else:
+                    # Non-empty content - buffer it
+                    pending['data']['buffered_messages'][seq] = content
+                    pending['data']['received_count'] += 1
+                    print(f"[S01] Buffered message seq={seq} for conversation {conversation_id}")
+                
+                # Try to emit buffered messages in order
+                self._emit_buffered_messages(request_id, pending, conversation_id)
+                
+                # Check if we've received all messages and can finalize
+                total = pending['data'].get('total_messages')
+                received = pending['data']['received_count']
+                if total is not None and received >= total - 1:  # -1 because empty message doesn't count
+                    # All messages received and emitted
                     print(f"[S01] A02 streaming complete for conversation {conversation_id}")
                     if pending['data'].get('stream_started'):
                         self.socketio.emit('text_stop', {
@@ -858,27 +880,45 @@ class ConsultationService:
                     # Clean up
                     del self.pending_requests[request_id]
                     return
-                
-                # Accumulate non-empty content
-                pending['data']['accumulated_content'] += content
-                
-                # Stream to frontend immediately
-                if conversation_id:
-                    # Send chunk to frontend
-                    if not pending['data'].get('stream_started'):
-                        self.socketio.emit('text_start', {
-                            'conversation_id': conversation_id
-                        }, room=conversation_id)
-                        pending['data']['stream_started'] = True
-                    
-                    self.socketio.emit('text_chunk', {
-                        'conversation_id': conversation_id,
-                        'timestamp': int(time.time() * 1000),
-                        'sender_type': 'AI_AGENT',
-                        'sender_id': None,
-                        'sender_name': None,
-                        'content': content
-                    }, room=conversation_id)
+    
+    def _emit_buffered_messages(self, request_id: str, pending: dict, conversation_id: str):
+        """Emit buffered messages in order to Socket.IO"""
+        buffered = pending['data']['buffered_messages']
+        next_seq = pending['data']['next_seq_to_emit']
+        
+        # Emit all consecutive messages starting from next_seq
+        while next_seq in buffered:
+            content = buffered[next_seq]
+            
+            # Send text_start event before first chunk
+            if not pending['data'].get('stream_started'):
+                self.socketio.emit('text_start', {
+                    'conversation_id': conversation_id
+                }, room=conversation_id)
+                pending['data']['stream_started'] = True
+                print(f"[S01] Started streaming for conversation {conversation_id}")
+            
+            # Emit the chunk
+            self.socketio.emit('text_chunk', {
+                'conversation_id': conversation_id,
+                'timestamp': int(time.time() * 1000),
+                'sender_type': 'AI_AGENT',
+                'sender_id': None,
+                'sender_name': None,
+                'content': content
+            }, room=conversation_id)
+            
+            # Accumulate content
+            pending['data']['accumulated_content'] += content
+            
+            # Remove from buffer
+            del buffered[next_seq]
+            next_seq += 1
+            
+            print(f"[S01] Emitted message seq={next_seq - 1} for conversation {conversation_id}")
+        
+        # Update next sequence to emit
+        pending['data']['next_seq_to_emit'] = next_seq
     
     def _consume_a36b_events(self):
         """Consumer for A36b events from S19"""

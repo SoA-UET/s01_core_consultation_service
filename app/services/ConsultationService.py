@@ -1802,15 +1802,13 @@ class ConsultationService:
                     
                     if audio_data:
                         # Step 11: Send audio to frontend
-                        # Encode audio as base64 for JSON transport
-                        audio_base64 = base64.b64encode(audio_data).decode('utf-8')
                         
                         self.socketio.emit(
                             'audio_file',
                             {
                                 'conversation_id': conversation_id,
-                                'audio_data': audio_base64,
-                                'format': 'mp3'
+                                'audio_data': audio_data,
+                                'mime_type': 'audio/mpeg'
                             },
                             room=conversation_id
                         )

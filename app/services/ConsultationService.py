@@ -909,8 +909,8 @@ class ConsultationService:
             # Check if this is a voice call
             request_type = pending.get('type', 'text')
             if request_type == 'voice_call':
-                # Route to voice call handler
-                self._handle_voice_call_ai_response_chunk(request_id, pending, result)
+                # Route to voice call handler (keep lock held to prevent race conditions)
+                self._handle_voice_call_ai_response_chunk_locked(request_id, pending, result)
                 return
             
             status = result.get('status')
@@ -1676,9 +1676,9 @@ class ConsultationService:
             # Format history as string for A02
             history_str = ""
             for msg in history_messages[:-1]:  # Exclude the current message
-                sender = msg.get('sender_type', 'UNKNOWN')
+                sender_type = msg.get('sender_type', 'CUSTOMER')
                 content = msg.get('content', '')
-                history_str += f"{sender}: {content}\n"
+                history_str += f"{sender_type}: {content}\n"
             
             # Step 8: Send to S02 AI Agent
             request_id = f"{conversation_id}_voice_{int(time.time() * 1000)}"
@@ -1757,8 +1757,8 @@ class ConsultationService:
             print(f"[S01] Error calling S20 TTS: {e}")
             return None
     
-    def _handle_voice_call_ai_response_chunk(self, request_id: str, pending: dict, result: dict):
-        """Handle AI response chunk during voice call"""
+    def _handle_voice_call_ai_response_chunk_locked(self, request_id: str, pending: dict, result: dict):
+        """Handle AI response chunk during voice call (called with pending_requests_lock held)"""
         conversation_id = pending['conversation_id']
         
         status = result.get('status')
@@ -1769,6 +1769,11 @@ class ConsultationService:
             # Handle error case
             print(f"[S01] AI Agent error during voice call: {content}")
             
+            # Clean up (lock already held)
+            if request_id in self.pending_requests:
+                del self.pending_requests[request_id]
+            
+            # Send notifications outside of data processing
             if content == 'FORWARD':
                 # AI cannot answer, need to forward to human agent
                 self._switch_to_forwarding_status(conversation_id)
@@ -1778,21 +1783,21 @@ class ConsultationService:
                     {'message': f'AI Agent error: {content}'},
                     room=conversation_id
                 )
-            
-            # Clean up
-            with self.pending_requests_lock:
-                if request_id in self.pending_requests:
-                    del self.pending_requests[request_id]
             return
         
         elif status == 'success':
             # Check if content is empty - this signals end of stream
             if content == '':
-                # End of stream - convert accumulated text to speech
+                # End of stream - get full response and clean up (lock already held)
                 full_response = pending['data']['full_response']
                 
+                # Clean up pending request before making external calls
+                if request_id in self.pending_requests:
+                    del self.pending_requests[request_id]
+                
                 if full_response:
-                    # Step 9: Convert to speech via TTS
+                    # Step 9: Convert to speech via TTS (do this after releasing data)
+                    print(f"[S01] Converting voice response to audio for conversation {conversation_id}, text length: {len(full_response)}")
                     audio_data = self._call_s20_tts(full_response)
                     
                     if audio_data:
@@ -1810,7 +1815,7 @@ class ConsultationService:
                             room=conversation_id
                         )
                         
-                        print(f"[S01] Sent audio response to frontend for conversation {conversation_id}")
+                        print(f"[S01] Sent audio response to frontend for conversation {conversation_id}, audio size: {len(audio_data)} bytes")
                         
                         # Save AI message to database
                         self._save_ai_message(conversation_id, full_response)
@@ -1821,12 +1826,7 @@ class ConsultationService:
                             {'message': 'Text-to-speech conversion failed'},
                             room=conversation_id
                         )
-                
-                # Clean up pending request
-                with self.pending_requests_lock:
-                    if request_id in self.pending_requests:
-                        del self.pending_requests[request_id]
             else:
-                # Accumulate response text chunk
+                # Accumulate response text chunk (lock already held, safe to modify)
                 pending['data']['full_response'] += content
-                print(f"[S01] Accumulated voice response chunk seq={seq}, total length: {len(pending['data']['full_response'])}")
+                print(f"[S01] Accumulated voice response chunk seq={seq}, chunk length: {len(content)}, total length: {len(pending['data']['full_response'])}")
